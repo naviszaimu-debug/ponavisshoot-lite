@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PNS簡易カメラ</title>
+<!--
+  PNS簡易カメラ(2026-11-20 作成。R081120_PNS簡易カメラ)
+  顧客がスマホで証憑を撮って送るだけの画面。ボタンは「撮影」と「送信」の2つだけ。
+  - 専用URL(?token=…)で開く。GASの action:'hello' で顧客名・案内文を取り、action 未指定(upload)で1枚ずつ送る。
+  - 撮影はスマホ標準のカメラ(input capture)。撮れた写真は端末内(IndexedDB)に溜め、「送信」で送る。
+    iPhoneはカメラから戻る時にページが再読み込みされることがあるため、溜めた写真は端末内に保存して復元する。
+  - 送る前に必ず canvas で長辺2200pxへ縮小して向きを焼き込む(回転ボタンは不要)。
+  - 1枚=1ファイル(複数ページをまとめる機能は無い)。証憑の種類の選択・パスワード入力も無い。
+  - GAS_URL を新しいGASのウェブアプリURLに書き換えて使う。未設定の間は ?mock=1 で動作確認ができる。
+-->
+<style>
+  :root { --blue:#1565c0; --green:#2e7d32; --red:#c62828; --ink:#222; --sub:#666; --bg:#f5f7fa; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; }
+  body { font-family:"Meiryo","メイリオ",sans-serif; color:var(--ink); background:var(--bg); display:flex; flex-direction:column; }
+  header { padding:14px 16px 8px; text-align:center; background:#fff; border-bottom:1px solid #ddd; }
+  #custName { font-size:18px; font-weight:bold; margin:0; word-break:break-all; }
+  #custMsg { font-size:13px; color:var(--sub); margin:4px 0 0; white-space:pre-wrap; }
+  main { flex:1; overflow-y:auto; padding:14px 16px 8px; }
+  button { font-family:inherit; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  #btnShoot { display:block; width:100%; min-height:110px; border:0; border-radius:16px; background:var(--blue); color:#fff; font-size:28px; font-weight:bold; }
+  #count { text-align:center; font-size:13px; color:var(--sub); margin:12px 0 6px; min-height:18px; }
+  #thumbs { display:grid; grid-template-columns:repeat(auto-fill, minmax(84px, 1fr)); gap:8px; }
+  .th { position:relative; padding:0; border:2px solid #bbb; border-radius:8px; background:#ddd; aspect-ratio:3/4; overflow:hidden; }
+  .th img { width:100%; height:100%; object-fit:cover; display:block; }
+  .th.fail { border-color:var(--red); }
+  .th .no { position:absolute; left:4px; top:4px; background:rgba(0,0,0,.6); color:#fff; font-size:11px; border-radius:4px; padding:1px 5px; }
+  .th .ng { position:absolute; left:0; right:0; bottom:0; background:var(--red); color:#fff; font-size:11px; text-align:center; }
+  #status { text-align:center; font-size:13px; min-height:20px; margin:10px 0 0; }
+  #status.error { color:var(--red); font-weight:bold; }
+  #status.ok { color:var(--green); font-weight:bold; }
+  footer { padding:10px 16px calc(12px + env(safe-area-inset-bottom)); background:#fff; border-top:1px solid #ddd; }
+  #btnSend { display:block; width:100%; min-height:72px; border:0; border-radius:14px; background:var(--green); color:#fff; font-size:24px; font-weight:bold; }
+  #overlay { position:fixed; inset:0; background:rgba(255,255,255,.88); display:none; align-items:center; justify-content:center; flex-direction:column; font-size:20px; font-weight:bold; z-index:10; }
+  #overlay.on { display:flex; }
+  #overlay small { font-weight:normal; font-size:13px; color:var(--sub); margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <p id="custName">読み込み中…</p>
+  <p id="custMsg"></p>
+</header>
+<main>
+  <button id="btnShoot" type="button" disabled>📷 撮影</button>
+  <div id="count"></div>
+  <div id="thumbs"></div>
+  <div id="status"></div>
+</main>
+<footer>
+  <button id="btnSend" type="button" disabled>✅ 送信</button>
+</footer>
+<div id="overlay"><div id="overlayText">送信中…</div><small>画面を閉じずにお待ちください</small></div>
+<input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none;">
+
+<script>
+// ▼ 新しいGAS(ウェブアプリ)のURLに書き換える。この文言のままだと「未設定」扱いで、?mock=1 のときだけ動作確認用の疑似送信になる。
+const GAS_URL = "https://script.google.com/macros/s/AKfycbzbn_AryQDvrMbXLjmGSK9S5c7PAohw7FxRGxkmp8aThEXkp6Ovax2Fi8P1-pj79Tin/exec";
+
+const UPLOAD_MAX_DIMENSION = 2200;   // 長辺の上限(px)。現行PNSと同じ
+const UPLOAD_JPEG_QUALITY = 0.85;    // 現行PNSと同じ
+const UPLOAD_CONCURRENCY = 3;        // 同時に送る枚数。現行PNSと同じ
+const MIME_TO_EXT = { 'image/jpeg':'jpg', 'image/png':'png', 'image/heic':'heic', 'image/heif':'heif', 'image/webp':'webp', 'image/gif':'gif' };
+
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const MOCK = GAS_URL.indexOf('ここに') === 0 && new URLSearchParams(location.search).get('mock') === '1';
+
+const $ = (id) => document.getElementById(id);
+const btnShoot = $('btnShoot'), btnSend = $('btnSend'), cameraInput = $('cameraInput');
+const thumbsEl = $('thumbs'), countEl = $('count'), statusEl = $('status');
+
+let queue = [];        // {id, blob, stamp, url, failed}
+let sending = false;
+let ready = false;     // helloが成功して使える状態か
+
+function setStatus(text, kind) { statusEl.textContent = text || ''; statusEl.className = kind || ''; }
+
+// ---------- 端末内保存(IndexedDB。使えない端末はメモリのみ) ----------
+let db = null;
+function openDb() {
+  return new Promise((resolve) => {
+    try {
+      const req = indexedDB.open('pnslite', 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore('photos', { keyPath: 'id' }); };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+}
+function dbPut(item) {
+  if (!db) return;
+  try { db.transaction('photos', 'readwrite').objectStore('photos').put({ id: item.id, token: TOKEN, blob: item.blob, stamp: item.stamp }); } catch (e) {}
+}
+function dbDelete(id) {
+  if (!db) return;
+  try { db.transaction('photos', 'readwrite').objectStore('photos').delete(id); } catch (e) {}
+}
+function dbLoadAll() {
+  return new Promise((resolve) => {
+    if (!db) return resolve([]);
+    try {
+      const req = db.transaction('photos', 'readonly').objectStore('photos').getAll();
+      req.onsuccess = () => resolve((req.result || []).filter(r => r.token === TOKEN));
+      req.onerror = () => resolve([]);
+    } catch (e) { resolve([]); }
+  });
+}
+
+// ---------- 画像の縮小(向きを画素に焼き込む。必ず再エンコードする) ----------
+function compressImage(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const w = img.naturalWidth, h = img.naturalHeight;
+      if (!w || !h) { resolve(file); return; }
+      const scale = Math.min(1, UPLOAD_MAX_DIMENSION / Math.max(w, h));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(w * scale);
+      canvas.height = Math.round(h * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => resolve(blob || file), 'image/jpeg', UPLOAD_JPEG_QUALITY);
+    };
+    // HEICなどブラウザが読めない形式は、縮小できないが元のまま送る(送信自体は成功させる)
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
+
+function pad(n) { return String(n).padStart(2, '0'); }
+function makeStamp() {
+  const d = new Date();
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+// ---------- 画面 ----------
+function render() {
+  thumbsEl.innerHTML = '';
+  queue.forEach((item, idx) => {
+    if (!item.url) item.url = URL.createObjectURL(item.blob);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'th' + (item.failed ? ' fail' : '');
+    b.setAttribute('aria-label', (idx + 1) + '枚目(タップで削除)');
+    b.innerHTML = '<img alt=""><span class="no">' + (idx + 1) + '</span>' + (item.failed ? '<span class="ng">未送信</span>' : '');
+    b.querySelector('img').src = item.url;
+    b.addEventListener('click', () => removeItem(item.id));
+    thumbsEl.appendChild(b);
+  });
+  const n = queue.length;
+  countEl.textContent = n ? (n + '枚 撮影済み(写真をタップすると削除します)') : '';
+  btnSend.textContent = '✅ 送信' + (n ? '(' + n + '枚)' : '');
+  btnSend.disabled = !ready || sending || n === 0;
+  btnShoot.disabled = !ready || sending;
+}
+
+function removeItem(id) {
+  if (sending) return;
+  const item = queue.find(q => q.id === id);
+  if (!item) return;
+  if (!confirm('この写真を削除しますか?(送信前の写真です)')) return;
+  if (item.url) URL.revokeObjectURL(item.url);
+  queue = queue.filter(q => q.id !== id);
+  dbDelete(id);
+  setStatus('');
+  render();
+}
+
+// ---------- 撮影 ----------
+btnShoot.addEventListener('click', () => { if (!btnShoot.disabled) { cameraInput.value = ''; cameraInput.click(); } });
+cameraInput.addEventListener('change', async () => {
+  const files = Array.from(cameraInput.files || []);
+  if (!files.length) return;
+  setStatus('');
+  for (const file of files) {
+    const blob = await compressImage(file);
+    const item = { id: Date.now() + '_' + Math.random().toString(36).slice(2, 6), blob: blob, stamp: makeStamp(), url: null, failed: false };
+    queue.push(item);
+    dbPut(item);
+  }
+  render();
+});
+
+// ---------- 送信 ----------
+async function postGas(payload) {
+  if (MOCK) {
+    await new Promise(r => setTimeout(r, 250));
+    window.__mockLog = window.__mockLog || [];
+    window.__mockLog.push({ action: payload.action || 'upload', filename: payload.filename, mimeType: payload.mimeType, bytes: payload.image ? payload.image.length : 0, token: payload.token });
+    if (payload.action === 'hello') return { ok: true, name: 'lt01_テスト商店㈱', message: '(動作確認用の疑似画面です。実際には送信されません)' };
+    if (window.__mockFailCount > 0) { window.__mockFailCount--; return { ok: false, error: '疑似エラー' }; }   // 動作確認用: 失敗時の表示を試す
+    return { ok: true, filename: payload.filename };
+  }
+  const res = await fetch(GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payload) });
+  return await res.json();
+}
+
+async function sendAll() {
+  if (sending || !ready || !queue.length) return;
+  sending = true;
+  render();
+  $('overlay').classList.add('on');
+  const items = queue.slice();   // 送信開始時点の分に固定(途中で増えても巻き込まない)
+  let done = 0, okCount = 0, stopMsg = '';
+  $('overlayText').textContent = '送信中… (0/' + items.length + ')';
+  let next = 0;
+  async function worker() {
+    while (next < items.length && !stopMsg) {
+      const i = next++;
+      const item = items[i];
+      try {
+        const mimeType = item.blob.type || 'image/jpeg';
+        const ext = MIME_TO_EXT[mimeType] || 'jpg';
+        // 末尾は写真ごとの固有の印(別々の送信で同じ秒に撮った写真でも名前が重ならないように)
+        const filename = 'receipt_' + item.stamp + '_' + String(item.id).split('_')[1] + '.' + ext;
+        const base64 = await blobToBase64(item.blob);
+        const data = await postGas({ image: base64, filename: filename, mimeType: mimeType, token: TOKEN });
+        if (data.needPassword) { stopMsg = 'このURLにはパスワードが設定されています。この画面ではパスワードを入力できません。担当者にご連絡ください。'; item.failed = true; }
+        else if (!data.ok) { item.failed = true; }
+        else { item.sent = true; okCount++; }
+      } catch (e) { item.failed = true; }
+      done++;
+      $('overlayText').textContent = '送信中… (' + done + '/' + items.length + ')';
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, items.length) }, worker));
+
+  // 送れた分だけ消す。失敗した分は残して再送できるようにする
+  items.forEach(it => { if (it.sent) { if (it.url) URL.revokeObjectURL(it.url); dbDelete(it.id); } });
+  queue = queue.filter(q => !q.sent);
+  sending = false;
+  $('overlay').classList.remove('on');
+  render();
+  const failCount = items.length - okCount;
+  if (stopMsg) setStatus(stopMsg, 'error');
+  else if (failCount === 0) setStatus('✅ ' + okCount + '枚を送りました', 'ok');
+  else setStatus(okCount + '枚送りました。' + failCount + '枚は送れませんでした(赤枠)。電波のよい所で、もう一度「送信」を押してください。', 'error');
+}
+btnSend.addEventListener('click', sendAll);
+
+window.addEventListener('beforeunload', (e) => { if (queue.length && !sending) { e.preventDefault(); e.returnValue = ''; } });
+
+// ---------- 起動 ----------
+async function init() {
+  render();
+  if (!TOKEN) { $('custName').textContent = 'URLが正しくありません'; setStatus('お渡ししたURLをそのまま開いてください。', 'error'); return; }
+  if (GAS_URL.indexOf('ここに') === 0 && !MOCK) { $('custName').textContent = '設定が済んでいません'; setStatus('GAS_URL が未設定です(担当者向け)。', 'error'); return; }
+  db = await openDb();
+  try {
+    const data = await postGas({ action: 'hello', token: TOKEN });
+    if (data.needPassword) { $('custName').textContent = 'パスワードが設定されています'; setStatus('この画面ではパスワードを入力できません。担当者にご連絡ください。', 'error'); return; }
+    if (!data.ok) throw new Error(data.error || '不明なエラー');
+    // 「顧客コード_顧客名」の顧客コード部分は顧客には見せない
+    $('custName').textContent = String(data.name || '').replace(/^[A-Za-z0-9]+_/, '') + ' 御中';
+    $('custMsg').textContent = data.message || '';
+    ready = true;
+  } catch (e) {
+    $('custName').textContent = '開けませんでした';
+    setStatus('URLが無効か、通信に失敗しました。お渡ししたURLを確認し、電波のよい所で開き直してください。', 'error');
+    return;
+  }
+  // 前回溜めたまま送っていない写真(再読み込みで消えないよう保存してある分)を戻す
+  const saved = await dbLoadAll();
+  saved.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  saved.forEach(r => queue.push({ id: r.id, blob: r.blob, stamp: r.stamp, url: null, failed: false }));
+  if (saved.length) setStatus('前回送っていない写真が ' + saved.length + '枚 あります。', '');
+  render();
+}
+init();
+</script>
+</body>
+</html>
